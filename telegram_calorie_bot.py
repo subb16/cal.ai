@@ -1,15 +1,15 @@
 import os
-import re
-import sqlite3
 from datetime import datetime, date
 from pathlib import Path
 import json
+import re
 from typing import Optional, Tuple, Dict, Any, List
 
 from rapidfuzz import process, fuzz
 from telegram import Update, ForceReply
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 from llm_food_normalizer import normalize_food_text
+from retrieval import load_kb_entries, retrieve_kb_context, save_kb_entries, add_kb_entry, delete_kb_entry
 import logging
 import csv
 
@@ -20,72 +20,63 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 # logger.setLevel(logging.DEBUG)
 
+# Suppress noisy HTTP request logs from httpx/telegram
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
 # --- Global in-memory cache for today ---
 live_today_cache = {}  # { user_id: { date_str: [entries] } }
 USER_BASE_DIR = Path('users_data')
+TARGETS_FILE = Path('user_targets.json')
+
+
+def ensure_user_dir(user_id: str) -> Path:
+    path = USER_BASE_DIR / f"user_{user_id}"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def load_user_targets() -> Dict[str, float]:
+    """Load user target calories from JSON file."""
+    if not TARGETS_FILE.exists():
+        return {}
+    try:
+        with open(TARGETS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_user_targets(targets: Dict[str, float]):
+    """Save user target calories to JSON file."""
+    with open(TARGETS_FILE, "w", encoding="utf-8") as f:
+        json.dump(targets, f, indent=2)
+
+
+def get_user_target(user_id: str) -> Optional[float]:
+    """Get target calories for a user. Returns None if not set."""
+    targets = load_user_targets()
+    return targets.get(user_id)
+
+
+def set_user_target(user_id: str, target_cal: float):
+    """Set target calories for a user."""
+    targets = load_user_targets()
+    targets[user_id] = target_cal
+    save_user_targets(targets)
+
+
 
 # --------------------
 # Telegram handlers
 # --------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
-    user_dir = USER_BASE_DIR / f"user_{user_id}"
-    user_dir.mkdir(parents=True, exist_ok=True)
+    ensure_user_dir(user_id)
     await update.message.reply_text(
         "Hi! I can help you track your calories and macronutrients. Send me what you ate (e.g. '2 eggs and 1 cup of rice').\nA personal folder has been set up for your logs!"
     )
 
-CSV_PATH = Path("db.csv")
-
-FIELDNAMES = ["date", "user_id", "calories", "protein", "carbs", "fat", "history"]
-
-def _load_all_rows() -> List[Dict[str, Any]]:
-    if not CSV_PATH.exists():
-        return []
-    with open(CSV_PATH, "r", newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        return list(reader)
-
-def _save_all_rows(rows: List[Dict[str, Any]]):
-    with open(CSV_PATH, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
-        writer.writeheader()
-        for row in rows:
-            writer.writerow(row)
-
-def update_user_day(date_str: str, user_id: str, new_cals: float, new_protein: float, new_carbs: float, new_fat: float, new_food: str):
-    # Load, update (or create), save back
-    all_rows = _load_all_rows()
-    for row in all_rows:
-        if row["date"] == date_str and row["user_id"] == user_id:
-            row["calories"] = str(float(row["calories"]) + new_cals)
-            row["protein"] = str(float(row.get("protein",0)) + new_protein)
-            row["carbs"] = str(float(row.get("carbs",0)) + new_carbs)
-            row["fat"] = str(float(row.get("fat",0)) + new_fat)
-            if row["history"]:
-                row["history"] += "; " + new_food
-            else:
-                row["history"] = new_food
-            _save_all_rows(all_rows)
-            return
-    # Not found: make new
-    all_rows.append({
-        "date": date_str,
-        "user_id": user_id,
-        "calories": str(new_cals),
-        "protein": str(new_protein),
-        "carbs": str(new_carbs),
-        "fat": str(new_fat),
-        "history": new_food,
-    })
-    _save_all_rows(all_rows)
-
-def get_user_day(date_str: str, user_id: str) -> Optional[Dict[str,Any]]:
-    all_rows = _load_all_rows()
-    for row in all_rows:
-        if row["date"] == date_str and row["user_id"] == user_id:
-            return row
-    return None
 
 def safe_float(val, default=0.0):
     try:
@@ -118,13 +109,20 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     user_id = str(update.effective_user.id)
     dt = date.today().isoformat()
-    user_dir = USER_BASE_DIR / f"user_{user_id}"
+    user_dir = ensure_user_dir(user_id)
     jsonl_path = user_dir / f"{dt}.jsonl"
+    kb_context = build_kb_context_for_message(text)
+    
+    if kb_context:
+        logger.info("📚 KB context retrieved and will be sent to LLM")
+        logger.info("KB context:\n%s", kb_context)
+    else:
+        logger.info("⚠️ No KB context found for this query")
 
     logger.info("Processing message from user %s: %s", user_id, text)
     try:
         logger.info("Calling LLM normalizer for user %s ...", user_id)
-        llm_items = normalize_food_text(text)
+        llm_items = normalize_food_text(text, kb_context=kb_context)
         logger.info("LLM returned %d items", len(llm_items) if llm_items else 0)
         logger.debug("Full LLM raw output: %s", llm_items)
     except Exception as e:
@@ -164,7 +162,20 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Make a short reply: log and day total
     meal_line = f"🍽️ *This meal*: {meal_cal:.0f} kcal, Protein: {meal_prot:.1f} g, Carbs: {meal_carbs:.1f} g, Fat: {meal_fat:.1f} g"
     day_line = f"📅 *Day total*: {total_cal:.0f} kcal, Protein: {total_prot:.1f} g, Carbs: {total_carbs:.1f} g, Fat: {total_fat:.1f} g"
+    
+    # Add remaining calories if target is set
+    target_cal = get_user_target(user_id)
+    remaining_lines = []
+    if target_cal is not None:
+        remaining = target_cal - total_cal
+        if remaining >= 0:
+            remaining_lines.append(f"🎯 *Remaining*: {remaining:.0f} kcal ({total_cal:.0f}/{target_cal:.0f})")
+        else:
+            remaining_lines.append(f"⚠️ *Over by*: {abs(remaining):.0f} kcal ({total_cal:.0f}/{target_cal:.0f})")
+    
     reply = meal_line + "\n" + day_line
+    if remaining_lines:
+        reply += "\n" + "\n".join(remaining_lines)
     await update.message.reply_text(reply, parse_mode="Markdown")
 
 async def summary_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -240,6 +251,93 @@ async def clearall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(f"No entries found for today to clear.")
 
+
+async def addnote_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.partition(" ")[2].strip()
+    if not text:
+        await update.message.reply_text("Usage: /addnote your note text")
+        return
+    note_id = add_kb_entry(text)
+    await update.message.reply_text(f"✅ Added note #{note_id}. It will be used for everyone.")
+
+
+async def notes_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    entries = load_kb_entries()
+    if not entries:
+        await update.message.reply_text("No notes saved yet. Use /addnote to add one.")
+        return
+    lines = [f"{entry['id']}. {entry['text']}" for entry in entries]
+    await update.message.reply_text("📚 *Knowledge base:*\n" + "\n".join(lines), parse_mode="Markdown")
+
+
+async def delnote_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if not args or not args[0].isdigit():
+        await update.message.reply_text("Usage: /delnote <note number>. See /notes to list them.")
+        return
+    note_id = int(args[0])
+    ok = delete_kb_entry(note_id)
+    if ok:
+        await update.message.reply_text(f"Deleted note #{note_id}.")
+    else:
+        await update.message.reply_text(f"Couldn't find note #{note_id}.")
+
+
+async def settarget_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Set target calories for the user."""
+    user_id = str(update.effective_user.id)
+    args = context.args
+    if not args or not args[0].replace('.', '').isdigit():
+        await update.message.reply_text("Usage: /settarget <calories>\nExample: /settarget 2000")
+        return
+    try:
+        target_cal = float(args[0])
+        if target_cal <= 0:
+            await update.message.reply_text("Target calories must be greater than 0.")
+            return
+        set_user_target(user_id, target_cal)
+        await update.message.reply_text(f"✅ Target calories set to {target_cal:.0f} kcal per day.")
+    except ValueError:
+        await update.message.reply_text("Invalid number. Usage: /settarget <calories>")
+
+
+
+async def users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not USER_BASE_DIR.exists():
+        count = 0
+    else:
+        count = sum(1 for path in USER_BASE_DIR.iterdir() if path.is_dir())
+    await update.message.reply_text(f"👥 Total users with data: {count}")
+
+
+def build_kb_context_for_message(text: str) -> Optional[str]:
+    """
+    Split a multi-item message into chunks (by 'and' / ','), run KB retrieval
+    for each chunk separately, and merge the results into a single context.
+    """
+    parts = re.split(r"\band\b|,", text, flags=re.IGNORECASE)
+    kb_lines: list[str] = []
+
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+
+        ctx = retrieve_kb_context(part)
+        if not ctx:
+            continue
+
+        # ctx may contain multiple "- Note #..." lines
+        for line in ctx.splitlines():
+            line = line.strip()
+            if line and line not in kb_lines:
+                kb_lines.append(line)
+
+    if not kb_lines:
+        return None
+
+    return "\n".join(kb_lines)
+
 # --------------------
 # Main
 # --------------------
@@ -254,6 +352,12 @@ def main():
     app.add_handler(CommandHandler("summary", summary_cmd))
     app.add_handler(CommandHandler("delete", delete_cmd))
     app.add_handler(CommandHandler("clear", clearall_cmd))
+    app.add_handler(CommandHandler("addtokb", addnote_cmd))
+    app.add_handler(CommandHandler("showkb", notes_cmd))
+    app.add_handler(CommandHandler("delkb", delnote_cmd))
+    app.add_handler(CommandHandler("totalusers", users_cmd))
+    app.add_handler(CommandHandler("setcal", settarget_cmd))
+
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 
